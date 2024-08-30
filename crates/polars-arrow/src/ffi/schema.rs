@@ -280,6 +280,14 @@ unsafe fn to_data_type(schema: &ArrowSchema) -> PolarsResult<ArrowDataType> {
             let child = schema.child(0);
             ArrowDataType::LargeList(Box::new(to_field(child)?))
         },
+        "+vl" => {
+            let child = schema.child(0);
+            ArrowDataType::ListView(Box::new(to_field(child)?))
+        },
+        "+vL" => {
+            let child = schema.child(0);
+            ArrowDataType::LargeListView(Box::new(to_field(child)?))
+        },
         "+m" => {
             let child = schema.child(0);
 
@@ -460,6 +468,8 @@ fn to_format(data_type: &ArrowDataType) -> String {
         ArrowDataType::Decimal256(precision, scale) => format!("d:{precision},{scale},256"),
         ArrowDataType::List(_) => "+l".to_string(),
         ArrowDataType::LargeList(_) => "+L".to_string(),
+        ArrowDataType::ListView(_) => "+vl".to_string(),
+        ArrowDataType::LargeListView(_) => "+vL".to_string(),
         ArrowDataType::Struct(_) => "+s".to_string(),
         ArrowDataType::FixedSizeBinary(size) => format!("w:{size}"),
         ArrowDataType::FixedSizeList(_, size) => format!("+w:{size}"),

@@ -105,6 +105,10 @@ pub enum ArrowDataType {
     FixedSizeList(Box<Field>, usize),
     /// A list of some logical data type whose offsets are represented as [`i64`].
     LargeList(Box<Field>),
+    // A list of some logical data type defined by unordered offsets and lengths represented as [`i32`].
+    ListView(Box<Field>),
+    // A list of some logical data type defined by unordered offsets and lengths represented as [`i64`].
+    LargeListView(Box<Field>),
     /// A nested [`ArrowDataType`] with a given number of [`Field`]s.
     Struct(Vec<Field>),
     /// A nested datatype that can represent slots of differing types.
@@ -210,6 +214,8 @@ impl From<ArrowDataType> for arrow_schema::DataType {
                 Self::FixedSizeList(Arc::new((*f).into()), size as _)
             },
             ArrowDataType::LargeList(f) => Self::LargeList(Arc::new((*f).into())),
+            ArrowDataType::ListView(f) => Self::ListView(Arc::new((*f).into())),
+            ArrowDataType::LargeListView(f) => Self::LargeListView(Arc::new((*f).into())),
             ArrowDataType::Struct(f) => Self::Struct(f.into_iter().map(ArrowField::from).collect()),
             ArrowDataType::Union(fields, Some(ids), mode) => {
                 let ids = ids.into_iter().map(|x| x as _);
@@ -472,6 +478,8 @@ impl ArrowDataType {
             List(_) => PhysicalType::List,
             FixedSizeList(_, _) => PhysicalType::FixedSizeList,
             LargeList(_) => PhysicalType::LargeList,
+            ListView(_) => PhysicalType::ListView,
+            LargeListView(_) => PhysicalType::LargeListView,
             Struct(_) => PhysicalType::Struct,
             Union(_, _, _) => PhysicalType::Union,
             Map(_, _) => PhysicalType::Map,

@@ -232,6 +232,8 @@ fn serialize_type(data_type: &ArrowDataType) -> arrow_format::ipc::Type {
         FixedSizeList(_, size) => ipc::Type::FixedSizeList(Box::new(ipc::FixedSizeList {
             list_size: *size as i32,
         })),
+        ListView(_) => ipc::Type::ListView(Box::new(ipc::ListView {})),
+        LargeListView(_) => ipc::Type::LargeListView(Box::new(ipc::LargeListView {})),
         Union(_, type_ids, mode) => ipc::Type::Union(Box::new(ipc::Union {
             mode: match mode {
                 UnionMode::Dense => ipc::UnionMode::Dense,
@@ -286,7 +288,9 @@ fn serialize_children(
         | Utf8View
         | BinaryView
         | Decimal256(_, _) => vec![],
-        FixedSizeList(inner, _) | LargeList(inner) | List(inner) | Map(inner, _) => {
+        ListView(inner) | LargeListView(inner) | 
+        FixedSizeList(inner, _) | LargeList(inner) | 
+        List(inner) | Map(inner, _) => {
             vec![serialize_field(inner, &ipc_field.fields[0])]
         },
         Union(fields, _, _) | Struct(fields) => fields
