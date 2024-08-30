@@ -24,6 +24,7 @@ use crate::bitmap::{Bitmap, MutableBitmap};
 use crate::datatypes::ArrowDataType;
 
 pub mod physical_binary;
+pub mod listview;
 
 pub trait Splitable: Sized {
     fn check_bound(&self, offset: usize) -> bool;
