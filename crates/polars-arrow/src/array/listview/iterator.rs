@@ -1,10 +1,11 @@
-use super::ListViewArrayGeneric;
-use crate::array::listview::ViewType;
-use crate::array::{ArrayAccessor, ArrayValuesIter, MutableBinaryViewArray};
+use super::ListViewArray;
+use crate::array::iterator::NonNullValuesIter;
+use crate::array::{Array, ArrayAccessor, ArrayValuesIter};
 use crate::bitmap::utils::{BitmapIter, ZipValidity};
+use crate::offset::Offset;
 
-unsafe impl<'a, T: ViewType + ?Sized> ArrayAccessor<'a> for ListViewArrayGeneric<T> {
-    type Item = &'a T;
+unsafe impl<'a, O: Offset> ArrayAccessor<'a> for ListViewArray<O> {
+    type Item = Box<dyn Array>;
 
     #[inline]
     unsafe fn value_unchecked(&'a self, index: usize) -> Self::Item {
@@ -13,35 +14,38 @@ unsafe impl<'a, T: ViewType + ?Sized> ArrayAccessor<'a> for ListViewArrayGeneric
 
     #[inline]
     fn len(&self) -> usize {
-        self.views.len()
+        self.len()
     }
 }
 
-/// Iterator of values of an [`BinaryArray`].
-pub type BinaryViewValueIter<'a, T> = ArrayValuesIter<'a, ListViewArrayGeneric<T>>;
+/// Iterator of values of a [`ListArray`].
+pub type ListValuesIter<'a, O> = ArrayValuesIter<'a, ListViewArray<O>>;
 
-impl<'a, T: ViewType + ?Sized> IntoIterator for &'a ListViewArrayGeneric<T> {
-    type Item = Option<&'a T>;
-    type IntoIter = ZipValidity<&'a T, BinaryViewValueIter<'a, T>, BitmapIter<'a>>;
+type ZipIter<'a, O> = ZipValidity<Box<dyn Array>, ListValuesIter<'a, O>, BitmapIter<'a>>;
+
+impl<'a, O: Offset> IntoIterator for &'a ListViewArray<O> {
+    type Item = Option<Box<dyn Array>>;
+    type IntoIter = ZipIter<'a, O>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
     }
 }
 
-unsafe impl<'a, T: ViewType + ?Sized> ArrayAccessor<'a> for MutableBinaryViewArray<T> {
-    type Item = &'a T;
-
-    #[inline]
-    unsafe fn value_unchecked(&'a self, index: usize) -> Self::Item {
-        self.value_unchecked(index)
+impl<'a, O: Offset> ListViewArray<O> {
+    /// Returns an iterator of `Option<Box<dyn Array>>`
+    pub fn iter(&'a self) -> ZipIter<'a, O> {
+        ZipValidity::new_with_validity(ListValuesIter::new(self), self.validity.as_ref())
     }
 
+    /// Returns an iterator of `Box<dyn Array>`
+    pub fn values_iter(&'a self) -> ListValuesIter<'a, O> {
+        ListValuesIter::new(self)
+    }
+
+    /// Returns an iterator of the non-null values `Box<dyn Array>`.
     #[inline]
-    fn len(&self) -> usize {
-        self.views().len()
+    pub fn non_null_values_iter(&'a self) -> NonNullValuesIter<'a, ListViewArray<O>> {
+        NonNullValuesIter::new(self, self.validity())
     }
 }
-
-/// Iterator of values of an [`MutableBinaryViewArray`].
-pub type MutableBinaryViewValueIter<'a, T> = ArrayValuesIter<'a, MutableBinaryViewArray<T>>;

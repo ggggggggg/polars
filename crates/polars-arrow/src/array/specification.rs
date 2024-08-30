@@ -41,7 +41,30 @@ pub(crate) fn try_check_offsets_bounds<O: Offset>(
         polars_bail!(ComputeError: "offsets must not exceed the values length")
     } else {
         Ok(())
+}
+}
+
+pub(crate) fn try_check_unordered_offset_length_pairs_bounds<O: Offset>(
+    offsets: &[O],
+    lengths: &[O],
+    values_len: usize,
+) -> PolarsResult<()> {
+    // offsets can be unordered, so we need to check all
+    for (offset, length) in offsets.iter().zip(lengths.iter()) {
+        let offset = offset.to_usize();
+        let length = length.to_usize();
+
+        // Check 0 <= offsets[i] <= length of the child array
+        if offset > values_len {
+            polars_bail!(ComputeError: "offsets must not exceed the values length");
+        }
+
+        // Check 0 <= offsets[i] + size[i] <= length of the child array
+        if offset + length > values_len {
+            polars_bail!(ComputeError: "offsets + lengths must not exceed the values length");
+        }
     }
+    Ok(())
 }
 
 /// # Error

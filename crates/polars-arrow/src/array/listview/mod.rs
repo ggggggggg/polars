@@ -1,479 +1,257 @@
-//! See thread: https://lists.apache.org/thread/w88tpz76ox8h3rxkjl4so6rg3f1rv7wt
+use super::specification::try_check_unordered_offset_length_pairs_bounds;
+use super::{new_empty_array, Array, Splitable};
+use crate::bitmap::Bitmap;
+use crate::datatypes::{ArrowDataType, Field};
+use crate::offset::{Offset, Offsets, OffsetsBuffer};
+
+#[cfg(feature = "arrow_rs")]
+mod data;
 mod ffi;
 pub(super) mod fmt;
 mod iterator;
+pub use iterator::*;
 mod mutable;
-mod view;
+pub use mutable::*;
+use polars_error::{polars_bail, PolarsResult};
 
-use std::any::Any;
-use std::fmt::Debug;
-use std::marker::PhantomData;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+// macros copied from array/mod.rs because I can't figure out visibility issues 
 
-use polars_error::*;
-
-use crate::array::Array;
-use crate::bitmap::Bitmap;
-use crate::buffer::Buffer;
-use crate::datatypes::ArrowDataType;
-
-mod private {
-    pub trait Sealed: Send + Sync {}
-
-    impl Sealed for str {}
-    impl Sealed for [u8] {}
-}
-pub use iterator::BinaryViewValueIter;
-// pub use mutable::MutableListViewArray;
-use polars_utils::aliases::{InitHashMaps, PlHashMap};
-use polars_utils::slice::GetSaferUnchecked;
-use private::Sealed;
-
-use crate::array::listview::view::validate_view;
-use crate::array::iterator::NonNullValuesIter;
-use crate::bitmap::utils::{BitmapIter, ZipValidity};
-// pub type BinaryViewArray = ListViewArrayGeneric<[u8]>;
-// pub type Utf8ViewArray = ListViewArrayGeneric<str>;
-pub use view::ListViewElement;
-
-use super::Splitable;
-
-// pub type MutablePlString = MutableListViewArray<str>;
-// pub type MutablePlBinary = MutableListViewArray<[u8]>;
-
-// static BIN_VIEW_TYPE: ArrowDataType = ArrowDataType::BinaryView;
-// static UTF8_VIEW_TYPE: ArrowDataType = ArrowDataType::Utf8View;
-
-
-pub struct ListViewArray {
-    data_type: ArrowDataType,
-    views: Buffer<ListViewElement>,
-    buffers: Arc<[Buffer<u8>]>,
-    validity: Option<Bitmap>,
-    /// Total bytes length if we would concatenate them all.
-    total_bytes_len: AtomicU64,
-    /// Total bytes in the buffer (excluding remaining capacity)
-    total_buffer_len: usize,
-}
-
-impl PartialEq for ListViewArray {
-    fn eq(&self, other: &Self) -> bool {
-        self.len() == other.len() && self.into_iter().zip(other).all(|(l, r)| l == r)
-    }
-}
-
-impl Clone for ListViewArray {
-    fn clone(&self) -> Self {
-        Self {
-            data_type: self.data_type.clone(),
-            views: self.views.clone(),
-            buffers: self.buffers.clone(),
-            validity: self.validity.clone(),
-            total_bytes_len: AtomicU64::new(self.total_bytes_len.load(Ordering::Relaxed)),
-            total_buffer_len: self.total_buffer_len,
-        }
-    }
-}
-
-unsafe impl Send for ListViewArray {}
-unsafe impl Sync for ListViewArray {}
-
-const UNKNOWN_LEN: u64 = u64::MAX;
-
-impl ListViewArray {
-    /// # Safety
-    /// The caller must ensure
-    /// - the data is valid utf8 (if required)
-    /// - The offsets match the buffers.
-    pub unsafe fn new_unchecked(
-        data_type: ArrowDataType,
-        views: Buffer<ListViewElement>,
-        buffers: Arc<[Buffer<u8>]>,
-        validity: Option<Bitmap>,
-        total_bytes_len: usize,
-        total_buffer_len: usize,
-    ) -> Self {
-        Self {
-            data_type,
-            views,
-            buffers,
-            validity,
-            total_bytes_len: AtomicU64::new(total_bytes_len as u64),
-            total_buffer_len,
-        }
-    }
-
-    /// Create a new BinaryViewArray but initialize a statistics compute.
-    ///
-    /// # Safety
-    /// The caller must ensure the invariants
-    pub unsafe fn new_unchecked_unknown_md(
-        data_type: ArrowDataType,
-        views: Buffer<ListViewElement>,
-        buffers: Arc<[Buffer<u8>]>,
-        validity: Option<Bitmap>,
-        total_buffer_len: Option<usize>,
-    ) -> Self {
-        let total_bytes_len = UNKNOWN_LEN as usize;
-        let total_buffer_len =
-            total_buffer_len.unwrap_or_else(|| buffers.iter().map(|b| b.len()).sum());
-        Self::new_unchecked(
-            data_type,
-            views,
-            buffers,
-            validity,
-            total_bytes_len,
-            total_buffer_len,
-        )
-    }
-
-    pub fn data_buffers(&self) -> &Arc<[Buffer<u8>]> {
-        &self.buffers
-    }
-
-    pub fn variadic_buffer_lengths(&self) -> Vec<i64> {
-        self.buffers.iter().map(|buf| buf.len() as i64).collect()
-    }
-
-    pub fn views(&self) -> &Buffer<ListViewElement> {
-        &self.views
-    }
-
-    pub fn into_views(self) -> Vec<ListViewElement> {
-        self.views.make_mut()
-    }
-
-    pub fn into_inner(
-        self,
-    ) -> (
-        Buffer<ListViewElement>,
-        Arc<[Buffer<u8>]>,
-        Option<Bitmap>,
-        usize,
-        usize,
-    ) {
-        let views = self.views;
-        let buffers = self.buffers;
-        let validity = self.validity;
-
-        (
-            views,
-            buffers,
-            validity,
-            self.total_bytes_len.load(Ordering::Relaxed) as usize,
-            self.total_buffer_len,
-        )
-    }
-
-    /// Apply a function over the views. This can be used to update views in operations like slicing.
-    ///
-    /// # Safety
-    /// Update the views. All invariants of the views apply.
-    pub unsafe fn apply_views<F: FnMut(ListViewElement) -> ListViewElement>(&self, mut update_view: F) -> Self {
-        let arr = self.clone();
-        let (views, buffers, validity, total_bytes_len, total_buffer_len) = arr.into_inner();
-    
-        let mut views = views.make_mut();
-        for v in views.iter_mut() {
-            *v = update_view(*v);
-        }
-        Self::new_unchecked(
-            self.data_type.clone(),
-            views.into(),
-            buffers,
-            validity,
-            total_bytes_len,
-            total_buffer_len,
-        )
-    }
-
-    pub fn try_new(
-        data_type: ArrowDataType,
-        views: Buffer<ListViewElement>,
-        buffers: Arc<[Buffer<u8>]>,
-        validity: Option<Bitmap>,
-    ) -> PolarsResult<Self> {
-
-        validate_view(views.as_ref(), buffers.as_ref())?;
-
-        if let Some(validity) = &validity {
-            polars_ensure!(validity.len()== views.len(), ComputeError: "validity mask length must match the number of values" )
-        }
-
-        unsafe {
-            Ok(Self::new_unchecked_unknown_md(
-                data_type, views, buffers, validity, None,
-            ))
-        }
-    }
-
-    /// Creates an empty [`BinaryViewArrayGeneric`], i.e. whose `.len` is zero.
-    #[inline]
-    pub fn new_empty(data_type: ArrowDataType) -> Self {
-        unsafe { Self::new_unchecked(data_type, Buffer::new(), Arc::from([]), None, 0, 0) }
-    }
-
-    /// Returns a new null [`BinaryViewArrayGeneric`] of `length`.
-    #[inline]
-    pub fn new_null(data_type: ArrowDataType, length: usize) -> Self {
-        let validity = Some(Bitmap::new_zeroed(length));
-        unsafe {
-            Self::new_unchecked(
-                data_type,
-                Buffer::zeroed(length),
-                Arc::from([]),
-                validity,
-                0,
-                0,
-            )
-        }
-    }
-
-    /// Returns the element at index `i`
-    /// # Panics
-    /// iff `i >= self.len()`
-    #[inline]
-    pub fn value(&self, i: usize) -> &T {
-        assert!(i < self.len());
-        unsafe { self.value_unchecked(i) }
-    }
-
-    /// Returns the element at index `i`
-    ///
-    /// # Safety
-    /// Assumes that the `i < self.len`.
-    #[inline]
-    pub unsafe fn value_unchecked(&self, i: usize) -> &T {
-        let v = self.views.get_unchecked_release(i);
-        T::from_bytes_unchecked(v.get_slice_unchecked(&self.buffers))
-    }
-
-    /// Returns an iterator of `Option<&T>` over every element of this array.
-    pub fn iter(&self) -> ZipValidity<&T, BinaryViewValueIter<T>, BitmapIter> {
-        ZipValidity::new_with_validity(self.values_iter(), self.validity.as_ref())
-    }
-
-    /// Returns an iterator of `&[u8]` over every element of this array, ignoring the validity
-    pub fn values_iter(&self) -> BinaryViewValueIter<T> {
-        BinaryViewValueIter::new(self)
-    }
-
-    pub fn len_iter(&self) -> impl Iterator<Item = u32> + '_ {
-        self.views.iter().map(|v| v.length)
-    }
-
-    /// Returns an iterator of the non-null values.
-    pub fn non_null_values_iter(&self) -> NonNullValuesIter<'_, ListViewArrayGeneric<T>> {
-        NonNullValuesIter::new(self, self.validity())
-    }
-
-    /// Returns an iterator of the non-null values.
-    pub fn non_null_views_iter(&self) -> NonNullValuesIter<'_, Buffer<ListViewElement>> {
-        NonNullValuesIter::new(self.views(), self.validity())
-    }
-
-    // impl_sliced!();
-    // impl_mut_validity!();
-    // impl_into_array!();
-
-    pub fn from_slice<S: AsRef<T>, P: AsRef<[Option<S>]>>(slice: P) -> Self {
-        let mutable = MutableListViewArray::from_iterator(
-            slice.as_ref().iter().map(|opt_v| opt_v.as_ref()),
-        );
-        mutable.into()
-    }
-
-    pub fn from_slice_values<S: AsRef<T>, P: AsRef<[S]>>(slice: P) -> Self {
-        let mutable =
-            MutableListViewArray::from_values_iter(slice.as_ref().iter().map(|v| v.as_ref()));
-        mutable.into()
-    }
-
-    /// Get the total length of bytes that it would take to concatenate all binary/str values in this array.
-    pub fn total_bytes_len(&self) -> usize {
-        let total = self.total_bytes_len.load(Ordering::Relaxed);
-        if total == UNKNOWN_LEN {
-            let total = self.len_iter().map(|v| v as usize).sum::<usize>();
-            self.total_bytes_len.store(total as u64, Ordering::Relaxed);
-            total
-        } else {
-            total as usize
-        }
-    }
-
-    /// Get the length of bytes that are stored in the variadic buffers.
-    pub fn total_buffer_len(&self) -> usize {
-        self.total_buffer_len
-    }
-
-    fn total_unshared_buffer_len(&self) -> usize {
-        // XXX: it is O(n), not O(1).
-        // Given this function is only called in `maybe_gc()`,
-        // it may not be worthy to add an extra field for this.
-        self.buffers
-            .iter()
-            .map(|buf| {
-                if buf.shared_count_strong() == 1 {
-                    buf.len()
-                } else {
-                    0
-                }
-            })
-            .sum()
-    }
-
-    #[inline(always)]
-    pub fn len(&self) -> usize {
-        self.views.len()
-    }
-
-    /// Garbage collect
-    pub fn gc(self) -> Self {
-        if self.buffers.is_empty() {
-            return self;
-        }
-        let mut mutable = MutableListViewArray::with_capacity(self.len());
-        let buffers = self.buffers.as_ref();
-
-        for view in self.views.as_ref() {
-            unsafe { mutable.push_view_copied_unchecked(*view, buffers) }
-        }
-        mutable.freeze().with_validity(self.validity)
-    }
-
-    pub fn is_sliced(&self) -> bool {
-        self.views.as_ptr() != self.views.storage_ptr()
-    }
-
-    pub fn maybe_gc(self) -> Self {
-        const GC_MINIMUM_SAVINGS: usize = 16 * 1024; // At least 16 KiB.
-
-        if self.total_buffer_len <= GC_MINIMUM_SAVINGS {
-            return self;
-        }
-
-        if Arc::strong_count(&self.buffers) != 1 {
-            // There are multiple holders of this `buffers`.
-            // If we allow gc in this case,
-            // it may end up copying the same content multiple times.
-            return self;
-        }
-
-        // Subtract the maximum amount of inlined strings to get a lower bound
-        // on the number of buffer bytes needed (assuming no dedup).
-        let total_bytes_len = self.total_bytes_len();
-        let buffer_req_lower_bound = total_bytes_len.saturating_sub(self.len() * 12);
-
-        let lower_bound_mem_usage_post_gc = self.len() * 16 + buffer_req_lower_bound;
-        // Use unshared buffer len. Shared buffer won't be freed; no savings.
-        let cur_mem_usage = self.len() * 16 + self.total_unshared_buffer_len();
-        let savings_upper_bound = cur_mem_usage.saturating_sub(lower_bound_mem_usage_post_gc);
-
-        if savings_upper_bound >= GC_MINIMUM_SAVINGS
-            && cur_mem_usage >= 4 * lower_bound_mem_usage_post_gc
-        {
-            self.gc()
-        } else {
+// macro implementing `with_validity` and `set_validity`
+macro_rules! impl_mut_validity {
+    () => {
+        /// Returns this array with a new validity.
+        /// # Panic
+        /// Panics iff `validity.len() != self.len()`.
+        #[must_use]
+        #[inline]
+        pub fn with_validity(mut self, validity: Option<Bitmap>) -> Self {
+            self.set_validity(validity);
             self
         }
-    }
 
-    pub fn make_mut(self) -> MutableListViewArray<T> {
-        let views = self.views.make_mut();
-        let completed_buffers = self.buffers.to_vec();
-        let validity = self.validity.map(|bitmap| bitmap.make_mut());
-        MutableListViewArray {
-            views,
-            completed_buffers,
-            in_progress_buffer: vec![],
-            validity,
-            phantom: Default::default(),
-            total_bytes_len: self.total_bytes_len.load(Ordering::Relaxed) as usize,
-            total_buffer_len: self.total_buffer_len,
-            stolen_buffers: PlHashMap::new(),
+        /// Sets the validity of this array.
+        /// # Panics
+        /// This function panics iff `values.len() != self.len()`.
+        #[inline]
+        pub fn set_validity(&mut self, validity: Option<Bitmap>) {
+            if matches!(&validity, Some(bitmap) if bitmap.len() != self.len()) {
+                panic!("validity must be equal to the array's length")
+            }
+            self.validity = validity;
+        }
+
+        /// Takes the validity of this array, leaving it without a validity mask.
+        #[inline]
+        pub fn take_validity(&mut self) -> Option<Bitmap> {
+            self.validity.take()
         }
     }
 }
 
-impl BinaryViewArray {
-    /// Validate the underlying bytes on UTF-8.
-    pub fn validate_utf8(&self) -> PolarsResult<()> {
-        // SAFETY: views are correct
-        unsafe { validate_utf8_only(&self.views, &self.buffers, &self.buffers) }
-    }
+// macro implementing `sliced` and `sliced_unchecked`
+macro_rules! impl_sliced {
+    () => {
+        /// Returns this array sliced.
+        /// # Implementation
+        /// This function is `O(1)`.
+        /// # Panics
+        /// iff `offset + length > self.len()`.
+        #[inline]
+        #[must_use]
+        pub fn sliced(self, offset: usize, length: usize) -> Self {
+            assert!(
+                offset + length <= self.len(),
+                "the offset of the new Buffer cannot exceed the existing length"
+            );
+            unsafe { Self::sliced_unchecked(self, offset, length) }
+        }
 
-    /// Convert [`BinaryViewArray`] to [`Utf8ViewArray`].
-    pub fn to_utf8view(&self) -> PolarsResult<Utf8ViewArray> {
-        self.validate_utf8()?;
-        unsafe { Ok(self.to_utf8view_unchecked()) }
-    }
+        /// Returns this array sliced.
+        /// # Implementation
+        /// This function is `O(1)`.
+        ///
+        /// # Safety
+        /// The caller must ensure that `offset + length <= self.len()`.
+        #[inline]
+        #[must_use]
+        pub unsafe fn sliced_unchecked(mut self, offset: usize, length: usize) -> Self {
+            Self::slice_unchecked(&mut self, offset, length);
+            self
+        }
+    };
+}
 
-    /// Convert [`BinaryViewArray`] to [`Utf8ViewArray`] without checking UTF-8.
+// macro implementing `boxed` and `arced`
+macro_rules! impl_into_array {
+    () => {
+        /// Boxes this array into a [`Box<dyn Array>`].
+        pub fn boxed(self) -> Box<dyn Array> {
+            Box::new(self)
+        }
+
+        /// Arcs this array into a [`std::sync::Arc<dyn Array>`].
+        pub fn arced(self) -> std::sync::Arc<dyn Array> {
+            std::sync::Arc::new(self)
+        }
+    };
+}
+
+// macro implementing common methods of trait `Array`
+macro_rules! impl_common_array {
+    () => {
+        #[inline]
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        #[inline]
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+
+        #[inline]
+        fn len(&self) -> usize {
+            self.len()
+        }
+
+        #[inline]
+        fn data_type(&self) -> &ArrowDataType {
+            &self.data_type
+        }
+
+        #[inline]
+        fn split_at_boxed(&self, offset: usize) -> (Box<dyn Array>, Box<dyn Array>) {
+            let (lhs, rhs) = $crate::array::Splitable::split_at(self, offset);
+            (Box::new(lhs), Box::new(rhs))
+        }
+
+        #[inline]
+        unsafe fn split_at_boxed_unchecked(
+            &self,
+            offset: usize,
+        ) -> (Box<dyn Array>, Box<dyn Array>) {
+            let (lhs, rhs) = unsafe { $crate::array::Splitable::split_at_unchecked(self, offset) };
+            (Box::new(lhs), Box::new(rhs))
+        }
+
+        #[inline]
+        fn slice(&mut self, offset: usize, length: usize) {
+            self.slice(offset, length);
+        }
+
+        #[inline]
+        unsafe fn slice_unchecked(&mut self, offset: usize, length: usize) {
+            self.slice_unchecked(offset, length);
+        }
+
+        #[inline]
+        fn to_boxed(&self) -> Box<dyn Array> {
+            Box::new(self.clone())
+        }
+    };
+}
+
+
+/// An [`Array`] semantically equivalent to `Vec<Option<Vec<Option<T>>>>` with Arrow's in-memory.
+#[derive(Clone)]
+pub struct ListViewArray<O: Offset> {
+    data_type: ArrowDataType,
+    offsets: OffsetsBuffer<O>,
+    lengths: OffsetsBuffer<O>,
+    values: Box<dyn Array>,
+    validity: Option<Bitmap>,
+}
+
+
+
+impl<O: Offset> ListViewArray<O> {
+    /// Creates a new [`ListViewArray`].
     ///
-    /// # Safety
-    /// The caller must ensure the underlying data is valid UTF-8.
-    pub unsafe fn to_utf8view_unchecked(&self) -> Utf8ViewArray {
-        Utf8ViewArray::new_unchecked(
-            ArrowDataType::Utf8View,
-            self.views.clone(),
-            self.buffers.clone(),
-            self.validity.clone(),
-            self.total_bytes_len.load(Ordering::Relaxed) as usize,
-            self.total_buffer_len,
+    /// # Errors
+    /// This function returns an error iff:
+    /// * The last offset is not equal to the values' length.
+    /// * the validity's length is not equal to `offsets.len()`.
+    /// * The `data_type`'s [`crate::datatypes::PhysicalType`] is not equal to either [`crate::datatypes::PhysicalType::List`] or [`crate::datatypes::PhysicalType::LargeList`].
+    /// * The `data_type`'s inner field's data type is not equal to `values.data_type`.
+    /// # Implementation
+    /// This function is `O(1)`
+    pub fn try_new(
+        data_type: ArrowDataType,
+        offsets: OffsetsBuffer<O>,
+        lengths: OffsetsBuffer<O>,
+        values: Box<dyn Array>,
+        validity: Option<Bitmap>,
+    ) -> PolarsResult<Self> {
+        try_check_unordered_offset_length_pairs_bounds(&offsets, &lengths, values.len())?;
+
+        if validity
+            .as_ref()
+            .map_or(false, |validity| validity.len() != offsets.len_proxy())
+        {
+            polars_bail!(ComputeError: "validity mask length must match the number of values")
+        }
+
+        let child_data_type = Self::try_get_child(&data_type)?.data_type();
+        let values_data_type = values.data_type();
+        if child_data_type != values_data_type {
+            polars_bail!(ComputeError: "ListViewArray's child's DataType must match. However, the expected DataType is {child_data_type:?} while it got {values_data_type:?}.");
+        }
+
+        Ok(Self {
+            data_type,
+            offsets,
+            lengths,
+            values,
+            validity,
+        })
+    }
+
+    /// Creates a new [`ListViewArray`].
+    ///
+    /// # Panics
+    /// This function panics iff:
+    /// * not 0 <= offsets[i] <= values.len()
+    /// * not 0 <= offsets[i] + lengths[i] <= values.len()
+    /// * the validity's length is not equal to `offsets.len()`.
+    /// * The `data_type`'s [`crate::datatypes::PhysicalType`] is not equal to either [`crate::datatypes::PhysicalType::List`] or [`crate::datatypes::PhysicalType::LargeList`].
+    /// * The `data_type`'s inner field's data type is not equal to `values.data_type`.
+    /// # Implementation
+    /// This function is `O(1)`
+    pub fn new(
+        data_type: ArrowDataType,
+        offsets: OffsetsBuffer<O>,
+        lengths: OffsetsBuffer<O>,
+        values: Box<dyn Array>,
+        validity: Option<Bitmap>,
+    ) -> Self {
+        Self::try_new(data_type, offsets, lengths,values, validity).unwrap()
+    }
+
+    /// Returns a new empty [`ListViewArray`].
+    pub fn new_empty(data_type: ArrowDataType) -> Self {
+        let values = new_empty_array(Self::get_child_type(&data_type).clone());
+        Self::new(data_type, OffsetsBuffer::default(), OffsetsBuffer::default(), values, None)
+    }
+
+    /// Returns a new null [`ListViewArray`].
+    #[inline]
+    pub fn new_null(data_type: ArrowDataType, length: usize) -> Self {
+        let child = Self::get_child_type(&data_type).clone();
+        Self::new(
+            data_type,
+            Offsets::new_zeroed(length).into(),
+            Offsets::new_zeroed(length).into(),
+            new_empty_array(child), 
+            Some(Bitmap::new_zeroed(length)),
         )
     }
 }
 
-impl Utf8ViewArray {
-    pub fn to_listview(&self) -> BinaryViewArray {
-        // SAFETY: same invariants.
-        unsafe {
-            BinaryViewArray::new_unchecked(
-                ArrowDataType::BinaryView,
-                self.views.clone(),
-                self.buffers.clone(),
-                self.validity.clone(),
-                self.total_bytes_len.load(Ordering::Relaxed) as usize,
-                self.total_buffer_len,
-            )
-        }
-    }
-}
-
-impl<T: ViewType + ?Sized> Array for ListViewArrayGeneric<T> {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-
-    #[inline(always)]
-    fn len(&self) -> usize {
-        ListViewArrayGeneric::len(self)
-    }
-
-    fn data_type(&self) -> &ArrowDataType {
-        T::dtype()
-    }
-
-    fn validity(&self) -> Option<&Bitmap> {
-        self.validity.as_ref()
-    }
-
-    fn split_at_boxed(&self, offset: usize) -> (Box<dyn Array>, Box<dyn Array>) {
-        let (lhs, rhs) = Splitable::split_at(self, offset);
-        (Box::new(lhs), Box::new(rhs))
-    }
-
-    unsafe fn split_at_boxed_unchecked(&self, offset: usize) -> (Box<dyn Array>, Box<dyn Array>) {
-        let (lhs, rhs) = unsafe { Splitable::split_at_unchecked(self, offset) };
-        (Box::new(lhs), Box::new(rhs))
-    }
-
-    fn slice(&mut self, offset: usize, length: usize) {
+impl<O: Offset> ListViewArray<O> {
+    /// Slices this [`ListViewArray`].
+    /// # Panics
+    /// panics iff `offset + length > self.len()`
+    pub fn slice(&mut self, offset: usize, length: usize) {
         assert!(
             offset + length <= self.len(),
             "the offset of the new Buffer cannot exceed the existing length"
@@ -481,60 +259,159 @@ impl<T: ViewType + ?Sized> Array for ListViewArrayGeneric<T> {
         unsafe { self.slice_unchecked(offset, length) }
     }
 
-    unsafe fn slice_unchecked(&mut self, offset: usize, length: usize) {
-        debug_assert!(offset + length <= self.len());
+    /// Slices this [`ListViewArray`].
+    ///
+    /// # Safety
+    /// The caller must ensure that `offset + length < self.len()`.
+    pub unsafe fn slice_unchecked(&mut self, offset: usize, length: usize) {
         self.validity = self
             .validity
             .take()
             .map(|bitmap| bitmap.sliced_unchecked(offset, length))
             .filter(|bitmap| bitmap.unset_bits() > 0);
-        self.views.slice_unchecked(offset, length);
-        self.total_bytes_len.store(UNKNOWN_LEN, Ordering::Relaxed)
+        self.offsets.slice_unchecked(offset, length + 1);
     }
 
-    fn with_validity(&self, validity: Option<Bitmap>) -> Box<dyn Array> {
-        let mut new = self.clone();
-        new.validity = validity;
-        Box::new(new)
+    impl_sliced!();
+    impl_mut_validity!();
+    impl_into_array!();
+}
+
+// Accessors
+impl<O: Offset> ListViewArray<O> {
+    /// Returns the length of this array
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.offsets.len_proxy()
     }
 
-    fn to_boxed(&self) -> Box<dyn Array> {
-        Box::new(self.clone())
+    /// Returns the element at index `i`
+    /// # Panic
+    /// Panics iff `i >= self.len()`
+    #[inline]
+    pub fn value(&self, i: usize) -> Box<dyn Array> {
+        assert!(i < self.len());
+        // SAFETY: invariant of this function
+        unsafe { self.value_unchecked(i) }
+    }
+
+    /// Returns the element at index `i` as &str
+    ///
+    /// # Safety
+    /// Assumes that the `i < self.len`.
+    #[inline]
+    pub unsafe fn value_unchecked(&self, i: usize) -> Box<dyn Array> {
+        // SAFETY: the invariant of the function
+        let (start, end) = self.offsets.start_end_unchecked(i);
+        let length = end - start;
+
+        // SAFETY: the invariant of the struct
+        self.values.sliced_unchecked(start, length)
+    }
+
+    /// The optional validity.
+    #[inline]
+    pub fn validity(&self) -> Option<&Bitmap> {
+        self.validity.as_ref()
+    }
+
+    /// The offsets [`Buffer`].
+    #[inline]
+    pub fn offsets(&self) -> &OffsetsBuffer<O> {
+        &self.offsets
+    }
+
+    /// The values.
+    #[inline]
+    pub fn values(&self) -> &Box<dyn Array> {
+        &self.values
     }
 }
 
-impl<T: ViewType + ?Sized> Splitable for ListViewArrayGeneric<T> {
+impl<O: Offset> ListViewArray<O> {
+    /// Returns a default [`ArrowDataType`]: inner field is named "item" and is nullable
+    pub fn default_datatype(data_type: ArrowDataType) -> ArrowDataType {
+        let field = Box::new(Field::new("item", data_type, true));
+        if O::IS_LARGE {
+            ArrowDataType::LargeList(field)
+        } else {
+            ArrowDataType::List(field)
+        }
+    }
+
+    /// Returns a the inner [`Field`]
+    /// # Panics
+    /// Panics iff the logical type is not consistent with this struct.
+    pub fn get_child_field(data_type: &ArrowDataType) -> &Field {
+        Self::try_get_child(data_type).unwrap()
+    }
+
+    /// Returns a the inner [`Field`]
+    /// # Errors
+    /// Panics iff the logical type is not consistent with this struct.
+    pub fn try_get_child(data_type: &ArrowDataType) -> PolarsResult<&Field> {
+        if O::IS_LARGE {
+            match data_type.to_logical_type() {
+                ArrowDataType::LargeList(child) => Ok(child.as_ref()),
+                _ => polars_bail!(ComputeError: "ListViewArray<i64> expects DataType::LargeList"),
+            }
+        } else {
+            match data_type.to_logical_type() {
+                ArrowDataType::List(child) => Ok(child.as_ref()),
+                _ => polars_bail!(ComputeError: "ListViewArray<i32> expects DataType::List"),
+            }
+        }
+    }
+
+    /// Returns a the inner [`ArrowDataType`]
+    /// # Panics
+    /// Panics iff the logical type is not consistent with this struct.
+    pub fn get_child_type(data_type: &ArrowDataType) -> &ArrowDataType {
+        Self::get_child_field(data_type).data_type()
+    }
+}
+
+impl<O: Offset> Array for ListViewArray<O> {
+    impl_common_array!();
+
+    fn validity(&self) -> Option<&Bitmap> {
+        self.validity.as_ref()
+    }
+
+    #[inline]
+    fn with_validity(&self, validity: Option<Bitmap>) -> Box<dyn Array> {
+        Box::new(self.clone().with_validity(validity))
+    }
+}
+
+impl<O: Offset> Splitable for ListViewArray<O> {
     fn check_bound(&self, offset: usize) -> bool {
         offset <= self.len()
     }
 
     unsafe fn _split_at_unchecked(&self, offset: usize) -> (Self, Self) {
-        let (lhs_views, rhs_views) = unsafe { self.views.split_at_unchecked(offset) };
+        let (lhs_offsets, rhs_offsets) = unsafe { self.offsets.split_at_unchecked(offset) };
+        let (lhs_lengths, rhs_lengths) = unsafe { self.lengths.split_at_unchecked(offset) };
         let (lhs_validity, rhs_validity) = unsafe { self.validity.split_at_unchecked(offset) };
 
-        unsafe {
-            (
-                Self::new_unchecked(
-                    self.data_type.clone(),
-                    lhs_views,
-                    self.buffers.clone(),
-                    lhs_validity,
-                    if offset == 0 { 0 } else { UNKNOWN_LEN as _ },
-                    self.total_buffer_len(),
-                ),
-                Self::new_unchecked(
-                    self.data_type.clone(),
-                    rhs_views,
-                    self.buffers.clone(),
-                    rhs_validity,
-                    if offset == self.len() {
-                        0
-                    } else {
-                        UNKNOWN_LEN as _
-                    },
-                    self.total_buffer_len(),
-                ),
-            )
-        }
+        (
+            Self {
+                data_type: self.data_type.clone(),
+                offsets: lhs_offsets,
+                lengths: lhs_lengths,
+                validity: lhs_validity,
+                values: self.values.clone(),
+            },
+            Self {
+                data_type: self.data_type.clone(),
+                offsets: rhs_offsets,
+                lengths: rhs_lengths,
+                validity: rhs_validity,
+                values: self.values.clone(),
+            },
+        )
     }
 }
+
+
+

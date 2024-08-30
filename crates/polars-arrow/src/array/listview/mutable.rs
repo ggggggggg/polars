@@ -1,644 +1,328 @@
-// use std::any::Any;
-// use std::fmt::{Debug, Formatter};
-// use std::ops::Deref;
-// use std::sync::Arc;
-
-// use hashbrown::hash_map::Entry;
-// use polars_error::PolarsResult;
-// use polars_utils::aliases::{InitHashMaps, PlHashMap};
-// use polars_utils::slice::GetSaferUnchecked;
-
-// use crate::array::listview::iterator::MutableBinaryViewValueIter;
-// use crate::array::listview::{ListViewArrayGeneric, ViewType, View};
-// use crate::array::{Array, MutableArray, TryExtend, TryPush};
-// use crate::bitmap::MutableBitmap;
-// use crate::buffer::Buffer;
-// use crate::datatypes::ArrowDataType;
-// use crate::legacy::trusted_len::TrustedLenPush;
-// use crate::trusted_len::TrustedLen;
-
-// const DEFAULT_BLOCK_SIZE: usize = 8 * 1024;
-// const MAX_EXP_BLOCK_SIZE: usize = 16 * 1024 * 1024;
-
-// pub struct MutableListViewArray<T: ViewType + ?Sized> {
-//     pub(crate) views: Vec<View>,
-//     pub(crate) completed_buffers: Vec<Buffer<u8>>,
-//     pub(crate) in_progress_buffer: Vec<u8>,
-//     pub(crate) validity: Option<MutableBitmap>,
-//     pub(crate) phantom: std::marker::PhantomData<T>,
-//     /// Total bytes length if we would concatenate them all.
-//     pub(crate) total_bytes_len: usize,
-//     /// Total bytes in the buffer (excluding remaining capacity)
-//     pub(crate) total_buffer_len: usize,
-//     /// Mapping from `Buffer::deref()` to index in `completed_buffers`.
-//     /// Used in `push_view()`.
-//     pub(crate) stolen_buffers: PlHashMap<usize, u32>,
-// }
-
-// impl<T: ViewType + ?Sized> Clone for MutableListViewArray<T> {
-//     fn clone(&self) -> Self {
-//         Self {
-//             views: self.views.clone(),
-//             completed_buffers: self.completed_buffers.clone(),
-//             in_progress_buffer: self.in_progress_buffer.clone(),
-//             validity: self.validity.clone(),
-//             phantom: Default::default(),
-//             total_bytes_len: self.total_bytes_len,
-//             total_buffer_len: self.total_buffer_len,
-//             stolen_buffers: PlHashMap::new(),
-//         }
-//     }
-// }
-
-// impl<T: ViewType + ?Sized> Debug for MutableListViewArray<T> {
-//     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-//         write!(f, "mutable-listview{:?}", T::DATA_TYPE)
-//     }
-// }
-
-// impl<T: ViewType + ?Sized> Default for MutableListViewArray<T> {
-//     fn default() -> Self {
-//         Self::with_capacity(0)
-//     }
-// }
-
-// impl<T: ViewType + ?Sized> From<MutableListViewArray<T>> for ListViewArrayGeneric<T> {
-//     fn from(mut value: MutableListViewArray<T>) -> Self {
-//         value.finish_in_progress();
-//         unsafe {
-//             Self::new_unchecked(
-//                 T::DATA_TYPE,
-//                 value.views.into(),
-//                 Arc::from(value.completed_buffers),
-//                 value.validity.map(|b| b.into()),
-//                 value.total_bytes_len,
-//                 value.total_buffer_len,
-//             )
-//         }
-//     }
-// }
-
-// impl<T: ViewType + ?Sized> MutableListViewArray<T> {
-//     pub fn new() -> Self {
-//         Self::default()
-//     }
-
-//     pub fn with_capacity(capacity: usize) -> Self {
-//         Self {
-//             views: Vec::with_capacity(capacity),
-//             completed_buffers: vec![],
-//             in_progress_buffer: vec![],
-//             validity: None,
-//             phantom: Default::default(),
-//             total_buffer_len: 0,
-//             total_bytes_len: 0,
-//             stolen_buffers: PlHashMap::new(),
-//         }
-//     }
-
-//     #[inline]
-//     pub fn views_mut(&mut self) -> &mut Vec<View> {
-//         &mut self.views
-//     }
-
-//     #[inline]
-//     pub fn views(&self) -> &[View] {
-//         &self.views
-//     }
-
-//     #[inline]
-//     pub fn completed_buffers(&self) -> &[Buffer<u8>] {
-//         &self.completed_buffers
-//     }
-
-//     pub fn validity(&mut self) -> Option<&mut MutableBitmap> {
-//         self.validity.as_mut()
-//     }
-
-//     /// Reserves `additional` elements and `additional_buffer` on the buffer.
-//     pub fn reserve(&mut self, additional: usize) {
-//         self.views.reserve(additional);
-//     }
-
-//     #[inline]
-//     pub fn len(&self) -> usize {
-//         self.views.len()
-//     }
-
-//     #[inline]
-//     pub fn capacity(&self) -> usize {
-//         self.views.capacity()
-//     }
-
-//     fn init_validity(&mut self, unset_last: bool) {
-//         let mut validity = MutableBitmap::with_capacity(self.views.capacity());
-//         validity.extend_constant(self.len(), true);
-//         if unset_last {
-//             validity.set(self.len() - 1, false);
-//         }
-//         self.validity = Some(validity);
-//     }
-
-//     /// # Safety
-//     /// - caller must allocate enough capacity
-//     /// - caller must ensure the view and buffers match.
-//     /// - The array must not have validity.
-//     pub(crate) unsafe fn push_view_copied_unchecked(&mut self, v: View, buffers: &[Buffer<u8>]) {
-//         let len = v.length;
-//         self.total_bytes_len += len as usize;
-//         if len <= 12 {
-//             debug_assert!(self.views.capacity() > self.views.len());
-//             self.views.push_unchecked(v)
-//         } else {
-//             self.total_buffer_len += len as usize;
-//             let data = buffers.get_unchecked_release(v.buffer_idx as usize);
-//             let offset = v.offset as usize;
-//             let bytes = data.get_unchecked_release(offset..offset + len as usize);
-//             let t = T::from_bytes_unchecked(bytes);
-//             self.push_value_ignore_validity(t)
-//         }
-//     }
-
-//     /// # Safety
-//     /// - caller must allocate enough capacity
-//     /// - caller must ensure the view and buffers match.
-//     /// - The array must not have validity.
-//     /// - caller must not mix use this function with other push functions.
-//     pub unsafe fn push_view_unchecked(&mut self, mut v: View, buffers: &[Buffer<u8>]) {
-//         let len = v.length;
-//         self.total_bytes_len += len as usize;
-//         if len <= 12 {
-//             self.views.push_unchecked(v);
-//         } else {
-//             let buffer = buffers.get_unchecked_release(v.buffer_idx as usize);
-//             let idx = match self.stolen_buffers.entry(buffer.deref().as_ptr() as usize) {
-//                 Entry::Occupied(entry) => *entry.get(),
-//                 Entry::Vacant(entry) => {
-//                     let idx = self.completed_buffers.len() as u32;
-//                     entry.insert(idx);
-//                     self.completed_buffers.push(buffer.clone());
-//                     self.total_buffer_len += buffer.len();
-//                     idx
-//                 },
-//             };
-//             v.buffer_idx = idx;
-//             self.views.push_unchecked(v);
-//         }
-//     }
-
-//     pub fn push_view(&mut self, mut v: View, buffers: &[Buffer<u8>]) {
-//         let len = v.length;
-//         self.total_bytes_len += len as usize;
-//         if len <= 12 {
-//             self.views.push(v);
-//         } else {
-//             // Do no mix use of push_view and push_value_ignore_validity -
-//             // it causes fragmentation.
-//             self.finish_in_progress();
-
-//             let buffer = &buffers[v.buffer_idx as usize];
-//             let idx = match self.stolen_buffers.entry(buffer.deref().as_ptr() as usize) {
-//                 Entry::Occupied(entry) => {
-//                     let idx = *entry.get();
-//                     let target_buffer = &self.completed_buffers[idx as usize];
-//                     debug_assert_eq!(buffer, target_buffer);
-//                     idx
-//                 },
-//                 Entry::Vacant(entry) => {
-//                     let idx = self.completed_buffers.len() as u32;
-//                     entry.insert(idx);
-//                     self.completed_buffers.push(buffer.clone());
-//                     self.total_buffer_len += buffer.len();
-//                     idx
-//                 },
-//             };
-//             v.buffer_idx = idx;
-//             self.views.push(v);
-//         }
-//         if let Some(validity) = &mut self.validity {
-//             validity.push(true)
-//         }
-//     }
-
-//     #[inline]
-//     pub fn push_value_ignore_validity<V: AsRef<T>>(&mut self, value: V) {
-//         let bytes = value.as_ref().to_bytes();
-//         self.total_bytes_len += bytes.len();
-
-//         // A string can only be maximum of 4GB in size.
-//         let len = u32::try_from(bytes.len()).unwrap();
-
-//         let view = if len <= View::MAX_INLINE_SIZE {
-//             View::new_inline(bytes)
-//         } else {
-//             self.total_buffer_len += bytes.len();
-
-//             // We want to make sure that we never have to memcopy between buffers. So if the
-//             // current buffer is not large enough, create a new buffer that is large enough and try
-//             // to anticipate the larger size.
-//             let required_capacity = self.in_progress_buffer.len() + bytes.len();
-//             let does_not_fit_in_buffer = self.in_progress_buffer.capacity() < required_capacity;
-
-//             // We can only save offsets that are below u32::MAX
-//             let offset_will_not_fit = self.in_progress_buffer.len() > u32::MAX as usize;
-
-//             if does_not_fit_in_buffer || offset_will_not_fit {
-//                 // Allocate a new buffer and flush the old buffer
-//                 let new_capacity = (self.in_progress_buffer.capacity() * 2)
-//                     .clamp(DEFAULT_BLOCK_SIZE, MAX_EXP_BLOCK_SIZE)
-//                     .max(bytes.len());
-//                 let in_progress = Vec::with_capacity(new_capacity);
-//                 let flushed = std::mem::replace(&mut self.in_progress_buffer, in_progress);
-//                 if !flushed.is_empty() {
-//                     self.completed_buffers.push(flushed.into())
-//                 }
-//             }
-
-//             let offset = self.in_progress_buffer.len() as u32;
-//             self.in_progress_buffer.extend_from_slice(bytes);
-
-//             let buffer_idx = u32::try_from(self.completed_buffers.len()).unwrap();
-
-//             View::new_from_bytes(bytes, buffer_idx, offset)
-//         };
-
-//         self.views.push(view);
-//     }
-
-//     #[inline]
-//     pub fn push_buffer(&mut self, buffer: Buffer<u8>) -> u32 {
-//         if !self.in_progress_buffer.is_empty() {
-//             self.completed_buffers
-//                 .push(Buffer::from(std::mem::take(&mut self.in_progress_buffer)));
-//         }
-
-//         let buffer_idx = self.completed_buffers.len();
-//         self.completed_buffers.push(buffer);
-//         buffer_idx as u32
-//     }
-
-//     #[inline]
-//     pub fn push_value<V: AsRef<T>>(&mut self, value: V) {
-//         if let Some(validity) = &mut self.validity {
-//             validity.push(true)
-//         }
-//         self.push_value_ignore_validity(value)
-//     }
-
-//     #[inline]
-//     pub fn push<V: AsRef<T>>(&mut self, value: Option<V>) {
-//         if let Some(value) = value {
-//             self.push_value(value)
-//         } else {
-//             self.push_null()
-//         }
-//     }
-
-//     #[inline]
-//     pub fn push_null(&mut self) {
-//         self.views.push(View::default());
-//         match &mut self.validity {
-//             Some(validity) => validity.push(false),
-//             None => self.init_validity(true),
-//         }
-//     }
-
-//     pub fn extend_null(&mut self, additional: usize) {
-//         if self.validity.is_none() && additional > 0 {
-//             self.init_validity(false);
-//         }
-//         self.views
-//             .extend(std::iter::repeat(View::default()).take(additional));
-//         if let Some(validity) = &mut self.validity {
-//             validity.extend_constant(additional, false);
-//         }
-//     }
-
-//     pub fn extend_constant<V: AsRef<T>>(&mut self, additional: usize, value: Option<V>) {
-//         if value.is_none() && self.validity.is_none() {
-//             self.init_validity(false);
-//         }
-
-//         if let Some(validity) = &mut self.validity {
-//             validity.extend_constant(additional, value.is_some())
-//         }
-
-//         // Push and pop to get the properly encoded value.
-//         // For long string this leads to a dictionary encoding,
-//         // as we push the string only once in the buffers
-//         let view_value = value
-//             .map(|v| {
-//                 self.push_value_ignore_validity(v);
-//                 self.views.pop().unwrap()
-//             })
-//             .unwrap_or_default();
-//         self.views
-//             .extend(std::iter::repeat(view_value).take(additional));
-//     }
-
-//     // impl_mutable_array_mut_validity!();
-
-//     #[inline]
-//     pub fn extend_values<I, P>(&mut self, iterator: I)
-//     where
-//         I: Iterator<Item = P>,
-//         P: AsRef<T>,
-//     {
-//         self.reserve(iterator.size_hint().0);
-//         for v in iterator {
-//             self.push_value(v)
-//         }
-//     }
-
-//     #[inline]
-//     pub fn extend_trusted_len_values<I, P>(&mut self, iterator: I)
-//     where
-//         I: TrustedLen<Item = P>,
-//         P: AsRef<T>,
-//     {
-//         self.extend_values(iterator)
-//     }
-
-//     #[inline]
-//     pub fn extend<I, P>(&mut self, iterator: I)
-//     where
-//         I: Iterator<Item = Option<P>>,
-//         P: AsRef<T>,
-//     {
-//         self.reserve(iterator.size_hint().0);
-//         for p in iterator {
-//             self.push(p)
-//         }
-//     }
-
-//     #[inline]
-//     pub fn extend_trusted_len<I, P>(&mut self, iterator: I)
-//     where
-//         I: TrustedLen<Item = Option<P>>,
-//         P: AsRef<T>,
-//     {
-//         self.extend(iterator)
-//     }
-
-//     #[inline]
-//     pub fn extend_views<I>(&mut self, iterator: I, buffers: &[Buffer<u8>])
-//     where
-//         I: Iterator<Item = Option<View>>,
-//     {
-//         self.reserve(iterator.size_hint().0);
-//         for p in iterator {
-//             match p {
-//                 Some(v) => self.push_view(v, buffers),
-//                 None => self.push_null(),
-//             }
-//         }
-//     }
-
-//     #[inline]
-//     pub fn extend_views_trusted_len<I>(&mut self, iterator: I, buffers: &[Buffer<u8>])
-//     where
-//         I: TrustedLen<Item = Option<View>>,
-//     {
-//         self.extend_views(iterator, buffers);
-//     }
-
-//     #[inline]
-//     pub fn extend_non_null_views<I>(&mut self, iterator: I, buffers: &[Buffer<u8>])
-//     where
-//         I: Iterator<Item = View>,
-//     {
-//         self.reserve(iterator.size_hint().0);
-//         for v in iterator {
-//             self.push_view(v, buffers);
-//         }
-//     }
-
-//     #[inline]
-//     pub fn extend_non_null_views_trusted_len<I>(&mut self, iterator: I, buffers: &[Buffer<u8>])
-//     where
-//         I: TrustedLen<Item = View>,
-//     {
-//         self.extend_non_null_views(iterator, buffers);
-//     }
-
-//     /// # Safety
-//     /// Same as `push_view_unchecked()`.
-//     #[inline]
-//     pub unsafe fn extend_non_null_views_unchecked<I>(&mut self, iterator: I, buffers: &[Buffer<u8>])
-//     where
-//         I: Iterator<Item = View>,
-//     {
-//         self.reserve(iterator.size_hint().0);
-//         for v in iterator {
-//             self.push_view_unchecked(v, buffers);
-//         }
-//     }
-
-//     /// # Safety
-//     /// Same as `push_view_unchecked()`.
-//     #[inline]
-//     pub unsafe fn extend_non_null_views_trusted_len_unchecked<I>(
-//         &mut self,
-//         iterator: I,
-//         buffers: &[Buffer<u8>],
-//     ) where
-//         I: TrustedLen<Item = View>,
-//     {
-//         self.extend_non_null_views_unchecked(iterator, buffers);
-//     }
-
-//     #[inline]
-//     pub fn from_iterator<I, P>(iterator: I) -> Self
-//     where
-//         I: Iterator<Item = Option<P>>,
-//         P: AsRef<T>,
-//     {
-//         let mut mutable = Self::with_capacity(iterator.size_hint().0);
-//         mutable.extend(iterator);
-//         mutable
-//     }
-
-//     pub fn from_values_iter<I, P>(iterator: I) -> Self
-//     where
-//         I: Iterator<Item = P>,
-//         P: AsRef<T>,
-//     {
-//         let mut mutable = Self::with_capacity(iterator.size_hint().0);
-//         mutable.extend_values(iterator);
-//         mutable
-//     }
-
-//     pub fn from<S: AsRef<T>, P: AsRef<[Option<S>]>>(slice: P) -> Self {
-//         Self::from_iterator(slice.as_ref().iter().map(|opt_v| opt_v.as_ref()))
-//     }
-
-//     fn finish_in_progress(&mut self) -> bool {
-//         if !self.in_progress_buffer.is_empty() {
-//             self.completed_buffers
-//                 .push(std::mem::take(&mut self.in_progress_buffer).into());
-//             true
-//         } else {
-//             false
-//         }
-//     }
-
-//     #[inline]
-//     pub fn freeze(self) -> ListViewArrayGeneric<T> {
-//         self.into()
-//     }
-
-//     #[inline]
-//     pub fn freeze_with_dtype(self, dtype: ArrowDataType) -> ListViewArrayGeneric<T> {
-//         let mut arr: ListViewArrayGeneric<T> = self.into();
-//         arr.data_type = dtype;
-//         arr
-//     }
-
-//     #[inline]
-//     pub fn value(&self, i: usize) -> &T {
-//         assert!(i < self.len());
-//         unsafe { self.value_unchecked(i) }
-//     }
-
-//     /// Returns the element at index `i`
-//     ///
-//     /// # Safety
-//     /// Assumes that the `i < self.len`.
-//     #[inline]
-//     pub unsafe fn value_unchecked(&self, i: usize) -> &T {
-//         self.value_from_view_unchecked(self.views.get_unchecked(i))
-//     }
-
-//     /// Returns the element indicated by the given view.
-//     ///
-//     /// # Safety
-//     /// Assumes the View belongs to this MutableBinaryViewArray.
-//     pub unsafe fn value_from_view_unchecked<'a>(&'a self, view: &'a View) -> &'a T {
-//         // View layout:
-//         // length: 4 bytes
-//         // prefix: 4 bytes
-//         // buffer_index: 4 bytes
-//         // offset: 4 bytes
-
-//         // Inlined layout:
-//         // length: 4 bytes
-//         // data: 12 bytes
-//         let len = view.length;
-//         let bytes = if len <= 12 {
-//             let ptr = view as *const View as *const u8;
-//             std::slice::from_raw_parts(ptr.add(4), len as usize)
-//         } else {
-//             let buffer_idx = view.buffer_idx as usize;
-//             let offset = view.offset;
-
-//             let data = if buffer_idx == self.completed_buffers.len() {
-//                 self.in_progress_buffer.as_slice()
-//             } else {
-//                 self.completed_buffers.get_unchecked_release(buffer_idx)
-//             };
-
-//             let offset = offset as usize;
-//             data.get_unchecked(offset..offset + len as usize)
-//         };
-//         T::from_bytes_unchecked(bytes)
-//     }
-
-//     /// Returns an iterator of `&[u8]` over every element of this array, ignoring the validity
-//     pub fn values_iter(&self) -> MutableBinaryViewValueIter<T> {
-//         MutableBinaryViewValueIter::new(self)
-//     }
-// }
-
-// impl MutableListViewArray<[u8]> {
-//     pub fn validate_utf8(&mut self, buffer_offset: usize, views_offset: usize) -> PolarsResult<()> {
-//         // Finish the in progress as it might be required for validation.
-//         let pushed = self.finish_in_progress();
-//         // views are correct
-//         unsafe {
-//             validate_utf8_only(
-//                 &self.views[views_offset..],
-//                 &self.completed_buffers[buffer_offset..],
-//                 &self.completed_buffers,
-//             )?
-//         }
-//         // Restore in-progress buffer as we don't want to get too small buffers
-//         if pushed {
-//             if let Some(last) = self.completed_buffers.pop() {
-//                 self.in_progress_buffer = last.into_mut().right().unwrap();
-//             }
-//         }
-//         Ok(())
-//     }
-// }
-
-// impl<T: ViewType + ?Sized, P: AsRef<T>> Extend<Option<P>> for MutableListViewArray<T> {
-//     #[inline]
-//     fn extend<I: IntoIterator<Item = Option<P>>>(&mut self, iter: I) {
-//         Self::extend(self, iter.into_iter())
-//     }
-// }
-
-// impl<T: ViewType + ?Sized, P: AsRef<T>> FromIterator<Option<P>> for MutableListViewArray<T> {
-//     #[inline]
-//     fn from_iter<I: IntoIterator<Item = Option<P>>>(iter: I) -> Self {
-//         Self::from_iterator(iter.into_iter())
-//     }
-// }
-
-// impl<T: ViewType + ?Sized> MutableArray for MutableListViewArray<T> {
-//     fn data_type(&self) -> &ArrowDataType {
-//         T::dtype()
-//     }
-
-//     fn len(&self) -> usize {
-//         MutableListViewArray::len(self)
-//     }
-
-//     fn validity(&self) -> Option<&MutableBitmap> {
-//         self.validity.as_ref()
-//     }
-
-//     fn as_box(&mut self) -> Box<dyn Array> {
-//         let mutable = std::mem::take(self);
-//         let arr: ListViewArrayGeneric<T> = mutable.into();
-//         arr.boxed()
-//     }
-
-//     fn as_any(&self) -> &dyn Any {
-//         self
-//     }
-
-//     fn as_mut_any(&mut self) -> &mut dyn Any {
-//         self
-//     }
-
-//     fn push_null(&mut self) {
-//         MutableListViewArray::push_null(self)
-//     }
-
-//     fn reserve(&mut self, additional: usize) {
-//         MutableListViewArray::reserve(self, additional)
-//     }
-
-//     fn shrink_to_fit(&mut self) {
-//         self.views.shrink_to_fit()
-//     }
-// }
-
-// impl<T: ViewType + ?Sized, P: AsRef<T>> TryExtend<Option<P>> for MutableListViewArray<T> {
-//     /// This is infallible and is implemented for consistency with all other types
-//     #[inline]
-//     fn try_extend<I: IntoIterator<Item = Option<P>>>(&mut self, iter: I) -> PolarsResult<()> {
-//         self.extend(iter.into_iter());
-//         Ok(())
-//     }
-// }
-
-// impl<T: ViewType + ?Sized, P: AsRef<T>> TryPush<Option<P>> for MutableListViewArray<T> {
-//     /// This is infallible and is implemented for consistency with all other types
-//     #[inline(always)]
-//     fn try_push(&mut self, item: Option<P>) -> PolarsResult<()> {
-//         self.push(item.as_ref().map(|p| p.as_ref()));
-//         Ok(())
-//     }
-// }
+use std::sync::Arc;
+
+use polars_error::{polars_err, PolarsResult};
+
+use super::ListViewArray;
+use crate::array::physical_binary::extend_validity;
+use crate::array::{Array, MutableArray, TryExtend, TryExtendFromSelf, TryPush};
+use crate::bitmap::MutableBitmap;
+use crate::datatypes::{ArrowDataType, Field};
+use crate::offset::{Offset, Offsets};
+use crate::trusted_len::TrustedLen;
+
+/// The mutable version of [`ListArray`].
+#[derive(Debug, Clone)]
+pub struct MutableListViewArray<O: Offset, M: MutableArray> {
+    data_type: ArrowDataType,
+    offsets: Offsets<O>,
+    lengths: Offsets<O>,
+    values: M,
+    validity: Option<MutableBitmap>,
+}
+
+impl<O: Offset, M: MutableArray + Default> MutableListViewArray<O, M> {
+    /// Creates a new empty [`MutableListViewArray`].
+    pub fn new() -> Self {
+        let values = M::default();
+        let data_type = ListViewArray::<O>::default_datatype(values.data_type().clone());
+        Self::new_from(values, data_type, 0)
+    }
+
+    /// Creates a new [`MutableListArray`] with a capacity.
+    pub fn with_capacity(capacity: usize) -> Self {
+        let values = M::default();
+        let data_type = ListViewArray::<O>::default_datatype(values.data_type().clone());
+
+        let offsets = Offsets::<O>::with_capacity(capacity);
+        let lengths = Offsets::<O>::with_capacity(capacity);
+        Self {
+            data_type,
+            offsets,
+            lengths,
+            values,
+            validity: None,
+        }
+    }
+}
+
+impl<O: Offset, M: MutableArray + Default> Default for MutableListViewArray<O, M> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<O: Offset, M: MutableArray> From<MutableListViewArray<O, M>> for ListViewArray<O> {
+    fn from(mut other: MutableListViewArray<O, M>) -> Self {
+        ListViewArray::new(
+            other.data_type,
+            other.offsets.into(),
+            other.lengths.into(),
+            other.values.as_box(),
+            other.validity.map(|x| x.into()),
+        )
+    }
+}
+
+impl<O, M, I, T> TryExtend<Option<I>> for MutableListViewArray<O, M>
+where
+    O: Offset,
+    M: MutableArray + TryExtend<Option<T>>,
+    I: IntoIterator<Item = Option<T>>,
+{
+    fn try_extend<II: IntoIterator<Item = Option<I>>>(&mut self, iter: II) -> PolarsResult<()> {
+        let iter = iter.into_iter();
+        self.reserve(iter.size_hint().0);
+        for items in iter {
+            self.try_push(items)?;
+        }
+        Ok(())
+    }
+}
+
+impl<O, M, I, T> TryPush<Option<I>> for MutableListViewArray<O, M>
+where
+    O: Offset,
+    M: MutableArray + TryExtend<Option<T>>,
+    I: IntoIterator<Item = Option<T>>,
+{
+    #[inline]
+    fn try_push(&mut self, item: Option<I>) -> PolarsResult<()> {
+        if let Some(items) = item {
+            let values = self.mut_values();
+            values.try_extend(items)?;
+            self.try_push_valid()?;
+        } else {
+            self.push_null();
+        }
+        Ok(())
+    }
+}
+
+impl<O, M> TryExtendFromSelf for MutableListViewArray<O, M>
+where
+    O: Offset,
+    M: MutableArray + TryExtendFromSelf,
+{
+    fn try_extend_from_self(&mut self, other: &Self) -> PolarsResult<()> {
+        extend_validity(self.len(), &mut self.validity, &other.validity);
+
+        self.values.try_extend_from_self(&other.values)?;
+        self.offsets.try_extend_from_self(&other.offsets)
+    }
+}
+
+impl<O: Offset, M: MutableArray> MutableListViewArray<O, M> {
+    /// Creates a new [`MutableListArray`] from a [`MutableArray`] and capacity.
+    pub fn new_from(values: M, data_type: ArrowDataType, capacity: usize) -> Self {
+        let offsets = Offsets::<O>::with_capacity(capacity);
+        let lengths = Offsets::<O>::with_capacity(capacity);
+        assert_eq!(values.len(), 0);
+        ListViewArray::<O>::get_child_field(&data_type);
+        Self {
+            data_type,
+            offsets,
+            lengths,
+            values,
+            validity: None,
+        }
+    }
+
+    /// Creates a new [`MutableListArray`] from a [`MutableArray`].
+    pub fn new_with_field(values: M, name: &str, nullable: bool) -> Self {
+        let field = Box::new(Field::new(name, values.data_type().clone(), nullable));
+        let data_type = if O::IS_LARGE {
+            ArrowDataType::LargeList(field)
+        } else {
+            ArrowDataType::List(field)
+        };
+        Self::new_from(values, data_type, 0)
+    }
+
+    /// Creates a new [`MutableListArray`] from a [`MutableArray`] and capacity.
+    pub fn new_with_capacity(values: M, capacity: usize) -> Self {
+        let data_type = ListViewArray::<O>::default_datatype(values.data_type().clone());
+        Self::new_from(values, data_type, capacity)
+    }
+
+    /// Creates a new [`MutableListArray`] from a [`MutableArray`], two [`Offsets`] one for offsets and one for lengths and
+    /// [`MutableBitmap`].
+    pub fn new_from_mutable(
+        values: M,
+        offsets: Offsets<O>,
+        lengths: Offsets<O>,
+        validity: Option<MutableBitmap>,
+    ) -> Self {
+        assert_eq!(values.len(), offsets.last().to_usize());
+        let data_type = ListViewArray::<O>::default_datatype(values.data_type().clone());
+        Self {
+            data_type,
+            offsets,
+            lengths,
+            values,
+            validity,
+        }
+    }
+
+    #[inline]
+    /// Needs to be called when a valid value was extended to this array.
+    /// This is a relatively low level function, prefer `try_push` when you can.
+    pub fn try_push_valid(&mut self) -> PolarsResult<()> {
+        let total_length = self.values.len();
+        let offset = self.offsets.last().to_usize();
+        let length = total_length
+            .checked_sub(offset)
+            .ok_or_else(|| polars_err!(ComputeError: "overflow"))?;
+
+        self.offsets.try_push(length)?;
+        if let Some(validity) = &mut self.validity {
+            validity.push(true)
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn push_null(&mut self) {
+        self.offsets.extend_constant(1);
+        match &mut self.validity {
+            Some(validity) => validity.push(false),
+            None => self.init_validity(),
+        }
+    }
+
+    /// Expand this array, using elements from the underlying backing array.
+    /// Assumes the expansion begins at the highest previous offset, or zero if
+    /// this [`MutableListArray`] is currently empty.
+    ///
+    /// Panics if:
+    /// - the new offsets are not in monotonic increasing order.
+    /// - any new offset is not in bounds of the backing array.
+    /// - the passed iterator has no upper bound.
+    pub fn try_extend_from_lengths<II>(&mut self, iterator: II) -> PolarsResult<()>
+    where
+        II: TrustedLen<Item = Option<usize>> + Clone,
+    {
+        self.offsets
+            .try_extend_from_lengths(iterator.clone().map(|x| x.unwrap_or_default()))?;
+        if let Some(validity) = &mut self.validity {
+            validity.extend_from_trusted_len_iter(iterator.map(|x| x.is_some()))
+        }
+        assert_eq!(self.offsets.last().to_usize(), self.values.len());
+        Ok(())
+    }
+
+    /// Returns the length of this array
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.offsets.len_proxy()
+    }
+
+    /// The values
+    pub fn mut_values(&mut self) -> &mut M {
+        &mut self.values
+    }
+
+    /// The offsets
+    pub fn offsets(&self) -> &Offsets<O> {
+        &self.offsets
+    }
+
+    /// The values
+    pub fn values(&self) -> &M {
+        &self.values
+    }
+
+    fn init_validity(&mut self) {
+        let len = self.offsets.len_proxy();
+
+        let mut validity = MutableBitmap::with_capacity(self.offsets.capacity());
+        validity.extend_constant(len, true);
+        validity.set(len - 1, false);
+        self.validity = Some(validity)
+    }
+
+    /// Converts itself into an [`Array`].
+    pub fn into_arc(self) -> Arc<dyn Array> {
+        let a: ListViewArray<O> = self.into();
+        Arc::new(a)
+    }
+
+    /// converts itself into [`Box<dyn Array>`]
+    pub fn into_box(self) -> Box<dyn Array> {
+        let a: ListViewArray<O> = self.into();
+        Box::new(a)
+    }
+
+    /// Reserves `additional` slots.
+    pub fn reserve(&mut self, additional: usize) {
+        self.offsets.reserve(additional);
+        if let Some(x) = self.validity.as_mut() {
+            x.reserve(additional)
+        }
+    }
+
+    /// Shrinks the capacity of the [`MutableListArray`] to fit its current length.
+    pub fn shrink_to_fit(&mut self) {
+        self.values.shrink_to_fit();
+        self.offsets.shrink_to_fit();
+        if let Some(validity) = &mut self.validity {
+            validity.shrink_to_fit()
+        }
+    }
+}
+
+impl<O: Offset, M: MutableArray + 'static> MutableArray for MutableListViewArray<O, M> {
+    fn len(&self) -> usize {
+        MutableListViewArray::len(self)
+    }
+
+    fn validity(&self) -> Option<&MutableBitmap> {
+        self.validity.as_ref()
+    }
+
+    fn as_box(&mut self) -> Box<dyn Array> {
+        ListViewArray::new(
+            self.data_type.clone(),
+            std::mem::take(&mut self.offsets).into(),
+            std::mem::take(&mut self.lengths).into(),
+            self.values.as_box(),
+            std::mem::take(&mut self.validity).map(|x| x.into()),
+        )
+        .boxed()
+    }
+
+    fn as_arc(&mut self) -> Arc<dyn Array> {
+        ListViewArray::new(
+            self.data_type.clone(),
+            std::mem::take(&mut self.offsets).into(),
+            std::mem::take(&mut self.lengths).into(),
+            self.values.as_box(),
+            std::mem::take(&mut self.validity).map(|x| x.into()),
+        )
+        .arced()
+    }
+
+    fn data_type(&self) -> &ArrowDataType {
+        &self.data_type
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_mut_any(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
+    #[inline]
+    fn push_null(&mut self) {
+        self.push_null()
+    }
+
+    fn reserve(&mut self, additional: usize) {
+        self.reserve(additional)
+    }
+
+    fn shrink_to_fit(&mut self) {
+        self.shrink_to_fit();
+    }
+}
