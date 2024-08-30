@@ -132,6 +132,36 @@ fn encode_dictionary(
                 encoded_dictionaries,
             )
         },
+        ListView => {
+            let values = array
+                .as_any()
+                .downcast_ref::<ListViewArray<i32>>()
+                .unwrap()
+                .values();
+            let field = &field.fields[0]; // todo: error instead
+            encode_dictionary(
+                field,
+                values.as_ref(),
+                options,
+                dictionary_tracker,
+                encoded_dictionaries,
+            )
+        },
+        LargeListView => {
+            let values = array
+                .as_any()
+                .downcast_ref::<ListViewArray<i64>>()
+                .unwrap()
+                .values();
+            let field = &field.fields[0]; // todo: error instead
+            encode_dictionary(
+                field,
+                values.as_ref(),
+                options,
+                dictionary_tracker,
+                encoded_dictionaries,
+            )
+        },
         Union => {
             let values = array
                 .as_any()

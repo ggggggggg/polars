@@ -25,6 +25,7 @@ use crate::datatypes::ArrowDataType;
 
 pub mod physical_binary;
 pub mod listview;
+pub use listview::ListViewArray;
 
 pub trait Splitable: Sized {
     fn check_bound(&self, offset: usize) -> bool;
@@ -328,6 +329,8 @@ impl std::fmt::Debug for dyn Array + '_ {
             List => fmt_dyn!(self, ListArray::<i32>, f),
             LargeList => fmt_dyn!(self, ListArray::<i64>, f),
             FixedSizeList => fmt_dyn!(self, FixedSizeListArray, f),
+            ListView => fmt_dyn!(self, ListViewArray<i32>, f),
+            LargeListView => fmt_dyn!(self, ListViewArray<i64>, f),
             Struct => fmt_dyn!(self, StructArray, f),
             Union => fmt_dyn!(self, UnionArray, f),
             Dictionary(key_type) => {
@@ -357,6 +360,8 @@ pub fn new_empty_array(data_type: ArrowDataType) -> Box<dyn Array> {
         List => Box::new(ListArray::<i32>::new_empty(data_type)),
         LargeList => Box::new(ListArray::<i64>::new_empty(data_type)),
         FixedSizeList => Box::new(FixedSizeListArray::new_empty(data_type)),
+        ListView => Box::new(ListViewArray::<i32>::new_empty(data_type)),
+        LargeListView => Box::new(ListViewArray::<i64>::new_empty(data_type)),
         Struct => Box::new(StructArray::new_empty(data_type)),
         Union => Box::new(UnionArray::new_empty(data_type)),
         Map => Box::new(MapArray::new_empty(data_type)),
@@ -389,6 +394,8 @@ pub fn new_null_array(data_type: ArrowDataType, length: usize) -> Box<dyn Array>
         List => Box::new(ListArray::<i32>::new_null(data_type, length)),
         LargeList => Box::new(ListArray::<i64>::new_null(data_type, length)),
         FixedSizeList => Box::new(FixedSizeListArray::new_null(data_type, length)),
+        ListView => Box::new(ListViewArray::<i32>::new_null(data_type, length)),
+        LargeListView => Box::new(ListViewArray::<i64>::new_null(data_type, length)),
         Struct => Box::new(StructArray::new_null(data_type, length)),
         Union => Box::new(UnionArray::new_null(data_type, length)),
         Map => Box::new(MapArray::new_null(data_type, length)),
@@ -468,6 +475,8 @@ pub fn to_data(array: &dyn Array) -> arrow_data::ArrayData {
         List => to_data_dyn!(array, ListArray::<i32>),
         LargeList => to_data_dyn!(array, ListArray::<i64>),
         FixedSizeList => to_data_dyn!(array, FixedSizeListArray),
+        ListView => to_data_dyn!(array, ListViewArray::<i32>),
+        LargeListView => to_data_dyn!(array, ListViewArray::<i64>),
         Struct => to_data_dyn!(array, StructArray),
         Union => to_data_dyn!(array, UnionArray),
         Dictionary(key_type) => {
@@ -499,6 +508,8 @@ pub fn from_data(data: &arrow_data::ArrayData) -> Box<dyn Array> {
         List => Box::new(ListArray::<i32>::from_data(data)),
         LargeList => Box::new(ListArray::<i64>::from_data(data)),
         FixedSizeList => Box::new(FixedSizeListArray::from_data(data)),
+        ListView => Box::new(ListViewArray::<i32>::from_data(data)),
+        LargeListView => Box::new(ListViewArray::<i64>::from_data(data)),
         Struct => Box::new(StructArray::from_data(data)),
         Union => Box::new(UnionArray::from_data(data)),
         Dictionary(key_type) => {
@@ -712,6 +723,8 @@ pub fn clone(array: &dyn Array) -> Box<dyn Array> {
         List => clone_dyn!(array, ListArray::<i32>),
         LargeList => clone_dyn!(array, ListArray::<i64>),
         FixedSizeList => clone_dyn!(array, FixedSizeListArray),
+        ListView => clone_dyn!(array, ListViewArray::<i32>),
+        LargeListView => clone_dyn!(array, ListViewArray::<i64>),
         Struct => clone_dyn!(array, StructArray),
         Union => clone_dyn!(array, UnionArray),
         Map => clone_dyn!(array, MapArray),

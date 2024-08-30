@@ -32,6 +32,8 @@ pub unsafe fn try_from<A: ArrowArrayRef>(array: A) -> PolarsResult<Box<dyn Array
         FixedSizeBinary => Box::new(FixedSizeBinaryArray::try_from_ffi(array)?),
         List => Box::new(ListArray::<i32>::try_from_ffi(array)?),
         LargeList => Box::new(ListArray::<i64>::try_from_ffi(array)?),
+        ListView => Box::new(ListArray::<i32>::try_from_ffi(array)?),
+        LargeListView => Box::new(ListArray::<i64>::try_from_ffi(array)?),
         FixedSizeList => Box::new(FixedSizeListArray::try_from_ffi(array)?),
         Struct => Box::new(StructArray::try_from_ffi(array)?),
         Dictionary(key_type) => {

@@ -1,6 +1,6 @@
 use arrow::array::{
     Array, BinaryArray, BinaryViewArray, BooleanArray, DictionaryArray, FixedSizeBinaryArray,
-    ListArray, NullArray, PrimitiveArray, StructArray, Utf8Array, Utf8ViewArray,
+    ListArray, ListViewArray, NullArray, PrimitiveArray, StructArray, Utf8Array, Utf8ViewArray,
 };
 use arrow::bitmap::Bitmap;
 use arrow::types::{days_ms, f16, i256, months_days_ns};
@@ -61,6 +61,8 @@ macro_rules! compare {
             PH::LargeUtf8 => call_binary!(Utf8Array<i64>, lhs, rhs, $op),
             PH::List => call_binary!(ListArray<i32>, lhs, rhs, $op),
             PH::LargeList => call_binary!(ListArray<i64>, lhs, rhs, $op),
+            PH::ListView => call_binary!(ListViewArray<i32>, lhs, rhs, $op),
+            PH::LargeListView => call_binary!(ListViewArray<i64>, lhs, rhs, $op),
             PH::Struct => call_binary!(StructArray, lhs, rhs, $op),
             PH::Union => todo!("Comparison of UnionArrays is not yet supported"),
             PH::Map => todo!("Comparison of MapArrays is not yet supported"),

@@ -82,6 +82,22 @@ pub fn get_value_display<'a, F: Write + 'a>(
                 f,
             )
         }),
+        ListView => Box::new(move |f, index| {
+            super::listview::fmt::write_value::<i32, _>(
+                array.as_any().downcast_ref().unwrap(),
+                index,
+                null,
+                f,
+            )
+        }),
+        LargeListView => Box::new(move |f, index| {
+            super::listview::fmt::write_value::<i64, _>(
+                array.as_any().downcast_ref().unwrap(),
+                index,
+                null,
+                f,
+            )
+        }),
         Struct => Box::new(move |f, index| {
             super::struct_::fmt::write_value(array.as_any().downcast_ref().unwrap(), index, null, f)
         }),

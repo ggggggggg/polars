@@ -45,6 +45,10 @@ pub enum PhysicalType {
     /// A string type that inlines small values
     /// and can intern strings.
     Utf8View,
+    // A list of data defined by a list of unordered 32-bit offsets and matching 32-bit lengths.
+    ListView,
+    // A list of data defined by a list of unordered 64-bit offsets and matching 64-bit lengths.
+    LargeListView,
 }
 
 impl PhysicalType {

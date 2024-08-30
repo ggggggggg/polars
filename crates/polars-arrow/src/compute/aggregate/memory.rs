@@ -77,6 +77,20 @@ pub fn estimated_bytes_size(array: &dyn Array) -> usize {
                 + array.offsets().len_proxy() * std::mem::size_of::<i32>()
                 + validity_size(array.validity())
         },
+        ListView => {
+            let array = array.as_any().downcast_ref::<ListViewArray<i32>>().unwrap();
+            estimated_bytes_size(array.values().as_ref())
+                + array.offsets().len_proxy() * std::mem::size_of::<i32>()
+                + array.lengths().len_proxy() * std::mem::size_of::<i32>()
+                + validity_size(array.validity())
+        },
+        LargeListView => {
+            let array = array.as_any().downcast_ref::<ListViewArray<i64>>().unwrap();
+            estimated_bytes_size(array.values().as_ref())
+                + array.offsets().len_proxy() * std::mem::size_of::<i64>()
+                + array.lengths().len_proxy() * std::mem::size_of::<i64>()
+                + validity_size(array.validity())
+        },
         FixedSizeList => {
             let array = array.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
             estimated_bytes_size(array.values().as_ref()) + validity_size(array.validity())

@@ -122,6 +122,8 @@ pub fn make_growable<'a>(
         ),
         List => dyn_growable!(list::GrowableList::<i32>, arrays, use_validity, capacity),
         LargeList => dyn_growable!(list::GrowableList::<i64>, arrays, use_validity, capacity),
+        ListView => todo!("implement GrowableListView"),
+        LargeListView => todo!("implement GrowableListView"),
         Struct => dyn_growable!(structure::GrowableStruct, arrays, use_validity, capacity),
         FixedSizeList => dyn_growable!(
             fixed_size_list::GrowableFixedSizeList,

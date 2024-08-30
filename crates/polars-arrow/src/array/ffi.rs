@@ -68,6 +68,8 @@ pub fn offset_buffers_children_dictionary(array: &dyn Array) -> BuffersChildren 
         List => ffi_dyn!(array, ListArray::<i32>),
         LargeList => ffi_dyn!(array, ListArray::<i64>),
         FixedSizeList => ffi_dyn!(array, FixedSizeListArray),
+        ListView => ffi_dyn!(array, ListViewArray::<i32>),
+        LargeListView => ffi_dyn!(array, ListViewArray::<i64>),
         Struct => ffi_dyn!(array, StructArray),
         Union => ffi_dyn!(array, UnionArray),
         Map => ffi_dyn!(array, MapArray),

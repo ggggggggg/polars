@@ -198,6 +198,30 @@ pub fn read_bytes<R: Read + Seek>(
     }
 }
 
+/// Reads a buffer of type `T` from the given reader, handling optional compression.
+/// 
+/// # Arguments
+/// 
+/// * `buf` - A mutable reference to a `VecDeque<IpcBuffer>` from which the buffer will be popped. This function consumes the front element of the `VecDeque`.
+/// * `length` - The number of slots to read. A slot is a unit of data corresponding to an element of type `T`.
+/// * `reader` - A mutable reference to the reader implementing `Read` and `Seek` traits.
+/// * `block_offset` - The offset in the block from where to start reading.
+/// * `is_little_endian` - A boolean indicating if the data is in little-endian format.
+/// * `compression` - An optional `Compression` enum indicating the compression type, if any.
+/// * `scratch` - A mutable reference to a `Vec<u8>` used as a scratch space for reading.
+/// 
+/// # Returns
+/// 
+/// * `PolarsResult<Buffer<T>>` - A result containing the read buffer of type `T` or an error.
+/// 
+/// # Errors
+/// 
+/// This function will return an error if:
+/// 
+/// * The `VecDeque<IpcBuffer>` is empty.
+/// * The offset or length of the buffer cannot be converted to `u64` or `usize` respectively.
+/// * Seeking in the reader fails.
+/// * Reading the buffer (compressed or uncompressed) fails.
 pub fn read_buffer<T: NativeType, R: Read + Seek>(
     buf: &mut VecDeque<IpcBuffer>,
     length: usize, // in slots

@@ -18,6 +18,7 @@ mod dictionary;
 mod fixed_size_binary;
 mod fixed_sized_list;
 mod list;
+mod listview;
 mod map;
 mod primitive;
 mod struct_;
@@ -30,6 +31,7 @@ pub(super) use dictionary::*;
 use fixed_size_binary::*;
 use fixed_sized_list::*;
 use list::*;
+use listview::*;
 use map::*;
 use primitive::*;
 use struct_::*;
@@ -123,6 +125,24 @@ pub fn write(
             compression,
         ),
         FixedSizeList => write_fixed_size_list(
+            array.as_any().downcast_ref().unwrap(),
+            buffers,
+            arrow_data,
+            nodes,
+            offset,
+            is_little_endian,
+            compression,
+        ),
+        ListView => write_listview::<i32>(
+            array.as_any().downcast_ref().unwrap(),
+            buffers,
+            arrow_data,
+            nodes,
+            offset,
+            is_little_endian,
+            compression,
+        ),
+        LargeListView => write_listview::<i64>(
             array.as_any().downcast_ref().unwrap(),
             buffers,
             arrow_data,
@@ -257,7 +277,25 @@ fn write_bitmap(
     }
 }
 
-/// writes `bytes` to `arrow_data` updating `buffers` and `offset` and guaranteeing a 8 byte boundary.
+/// Writes a buffer of type `T` to the `arrow_data` vector, updating the `buffers` vector and the `offset`,
+/// and guaranteeing an 8-byte boundary. Optionally compresses the buffer before writing.
+/// 
+/// # Arguments
+/// 
+/// * `buffer` - A slice of data of type `T` to be written.
+/// * `buffers` - A mutable reference to a vector of `ipc::Buffer` which will be updated with the new buffer's metadata.
+/// * `arrow_data` - A mutable reference to a vector of bytes where the buffer data will be appended.
+/// * `offset` - A mutable reference to an `i64` representing the current offset in the `arrow_data` vector. This will be updated.
+/// * `is_little_endian` - A boolean indicating if the data should be written in little-endian format.
+/// * `compression` - An optional `Compression` enum indicating the compression type to use, if any.
+/// 
+/// # Behavior
+/// 
+/// * The function appends the contents of `buffer` to the `arrow_data` vector.
+/// * If `compression` is specified, the buffer is compressed before being appended.
+/// * The function ensures that the data is aligned to an 8-byte boundary in the `arrow_data` vector.
+/// * The `buffers` vector is updated with a new `ipc::Buffer` containing the metadata (offset and length) of the written buffer.
+/// * The `offset` is updated to reflect the new position after the buffer has been written.
 fn write_buffer<T: NativeType>(
     buffer: &[T],
     buffers: &mut Vec<ipc::Buffer>,

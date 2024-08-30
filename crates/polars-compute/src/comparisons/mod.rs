@@ -81,6 +81,7 @@ mod boolean;
 mod dictionary;
 mod dyn_array;
 mod list;
+mod listview;
 mod null;
 mod scalar;
 mod struct_;

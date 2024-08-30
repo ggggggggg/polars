@@ -169,9 +169,10 @@ impl<O: Offset> ListViewArray<O> {
     ///
     /// # Errors
     /// This function returns an error iff:
-    /// * The last offset is not equal to the values' length.
+    /// * not all 0 <= offsets[i] <= values.len()
+    /// * not all 0 <= offsets[i] + lengths[i] <= values.len()
     /// * the validity's length is not equal to `offsets.len()`.
-    /// * The `data_type`'s [`crate::datatypes::PhysicalType`] is not equal to either [`crate::datatypes::PhysicalType::List`] or [`crate::datatypes::PhysicalType::LargeList`].
+    /// * The `data_type`'s [`crate::datatypes::PhysicalType`] is not equal to either [`crate::datatypes::PhysicalType::ListView`] or [`crate::datatypes::PhysicalType::LargeListView`].
     /// * The `data_type`'s inner field's data type is not equal to `values.data_type`.
     /// # Implementation
     /// This function is `O(1)`
@@ -210,8 +211,8 @@ impl<O: Offset> ListViewArray<O> {
     ///
     /// # Panics
     /// This function panics iff:
-    /// * not 0 <= offsets[i] <= values.len()
-    /// * not 0 <= offsets[i] + lengths[i] <= values.len()
+    /// * not all 0 <= offsets[i] <= values.len()
+    /// * not all 0 <= offsets[i] + lengths[i] <= values.len()
     /// * the validity's length is not equal to `offsets.len()`.
     /// * The `data_type`'s [`crate::datatypes::PhysicalType`] is not equal to either [`crate::datatypes::PhysicalType::List`] or [`crate::datatypes::PhysicalType::LargeList`].
     /// * The `data_type`'s inner field's data type is not equal to `values.data_type`.
@@ -319,6 +320,12 @@ impl<O: Offset> ListViewArray<O> {
     #[inline]
     pub fn offsets(&self) -> &OffsetsBuffer<O> {
         &self.offsets
+    }
+
+    /// The lengths [`Buffer`].
+    #[inline]
+    pub fn lengths(&self) -> &OffsetsBuffer<O> {
+        &self.lengths
     }
 
     /// The values.

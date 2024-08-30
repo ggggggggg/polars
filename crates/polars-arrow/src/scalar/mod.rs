@@ -105,6 +105,19 @@ macro_rules! dyn_new_list {
     }};
 }
 
+macro_rules! dyn_new_listview {
+    ($array:expr, $index:expr, $type:ty) => {{
+        let array = $array.as_any().downcast_ref::<ListViewArray<$type>>().unwrap();
+        let value = if array.is_valid($index) {
+            Some(array.value($index).into())
+        } else {
+            None
+        };
+        Box::new(ListScalar::<$type>::new(array.data_type().clone(), value))
+    }};
+}
+
+
 /// creates a new [`Scalar`] from an [`Array`].
 pub fn new_scalar(array: &dyn Array, index: usize) -> Box<dyn Scalar> {
     use PhysicalType::*;
@@ -139,6 +152,8 @@ pub fn new_scalar(array: &dyn Array, index: usize) -> Box<dyn Scalar> {
         LargeBinary => dyn_new_binary!(array, index, i64),
         List => dyn_new_list!(array, index, i32),
         LargeList => dyn_new_list!(array, index, i64),
+        ListView => dyn_new_listview!(array, index, i32),
+        LargeListView => dyn_new_listview!(array, index, i64),
         Struct => {
             let array = array.as_any().downcast_ref::<StructArray>().unwrap();
             if array.is_valid(index) {

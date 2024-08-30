@@ -9,6 +9,7 @@ mod dictionary;
 mod fixed_size_binary;
 mod fixed_size_list;
 mod list;
+mod listview;
 mod map;
 mod null;
 mod primitive;
@@ -251,6 +252,16 @@ pub fn equal(lhs: &dyn Array, rhs: &dyn Array) -> bool {
             let lhs = lhs.as_any().downcast_ref().unwrap();
             let rhs = rhs.as_any().downcast_ref().unwrap();
             list::equal::<i64>(lhs, rhs)
+        },
+        ListView => {
+            let lhs = lhs.as_any().downcast_ref().unwrap();
+            let rhs = rhs.as_any().downcast_ref().unwrap();
+            listview::equal::<i32>(lhs, rhs) 
+        },
+        LargeListView => {
+            let lhs = lhs.as_any().downcast_ref().unwrap();
+            let rhs = rhs.as_any().downcast_ref().unwrap();
+            listview::equal::<i64>(lhs, rhs) 
         },
         Struct => {
             let lhs = lhs.as_any().downcast_ref::<StructArray>().unwrap();
